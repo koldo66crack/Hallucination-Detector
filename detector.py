@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 from openai import OpenAI
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
+from typing import Literal
 import ssl
 
 try:
@@ -33,6 +34,15 @@ class AtomicClaim(BaseModel):
 
 class DecompositionResponse(BaseModel):
     claims: List[AtomicClaim]
+
+class Verdict(BaseModel):
+    claim_text: str
+    is_supported: Literal["Supported", "Contradicted", "Not Mentioned", "Ambiguous"]
+    explanation: str = Field(..., description="A brief explanation of why the claim is supported or not based *only* on the context.")
+    correction: str = Field(..., description="If contradicted, provide the correct information from the context. If unsupported, state 'N/A'.")
+
+class BatchVerification(BaseModel):
+    verdicts: List[Verdict]
 
 
 class HallucinationDetector:
@@ -93,7 +103,68 @@ class HallucinationDetector:
             "chunk_index": best_chunk_index
         }
 
-    def run_pipeline(self, rag_output: Dict[str, Any]):
+
+    def verify_claims(self, grouped_data: Dict[int, Any]):
+        """
+        Takes the grouped claims (by chunk) and runs the LLM Judge.
+        """
+        final_results = []
+        
+        print(f"\n--- 👨‍⚖️ The Judge is Deliberating ({len(grouped_data)} context groups) ---")
+
+        for chunk_idx, data in grouped_data.items():
+            chunk_text = data["chunk_text"]
+            claims_list = data["claims"]
+            
+            # Prepare the prompt inputs
+            # We explicitly list the claims we want checked
+            claims_text_block = "\n".join([f"- {c['claim']}" for c in claims_list])
+
+            print(f"Verifying {len(claims_list)} claims against Chunk {chunk_idx}...")
+
+            # The Judge Call
+            completion = self.client.beta.chat.completions.parse(
+                model="gpt-4o-2024-08-06",
+                messages=[
+                    {"role": "system", "content": (
+                        "You are a strict fact-checking judge. "
+                        "You will receive a Context Text and a list of Claims. "
+                        "Categories:\n"
+                        "1. Supported: The context explicitly states this or strongly implies it.\n"
+                        "2. Contradicted: The context explicitly contradicts this.\n"
+                        "3. Not Mentioned: The context does not contain information about this topic.\n"
+                        "4. Ambiguous: The context mentions the topic but is too vague or lacks specific details "
+                        "to confirm the claim (e.g., text says 'many people' but claim says '500 people')."
+                        "Do not use outside knowledge. Rely ONLY on the provided context."
+                    )},
+                    {"role": "user", "content": f"""
+                    CONTEXT:
+                    {chunk_text}
+
+                    CLAIMS TO VERIFY:
+                    {claims_text_block}
+                    """}
+                ],
+                response_format=BatchVerification,
+            )
+            
+            # Parse results
+            verdicts = completion.choices[0].message.parsed.verdicts
+            
+            # Merge the Judge's verdict back with our original metadata (scores, etc.)
+            for verdict, original_claim_data in zip(verdicts, claims_list):
+                final_results.append({
+                    "claim": original_claim_data["claim"],
+                    "score": original_claim_data["score"], # Keep the cosine score for reference
+                    "status": verdict.is_supported,
+                    "reasoning": verdict.explanation,
+                    "correction": verdict.correction,
+                    "evidence_used": original_claim_data["evidence_sentence"]
+                })
+
+        return final_results
+
+    def run_pipeline(self, rag_output: Dict[str, Any], threshold: float = 0.4):
         """
         Orchestrates the Full Flow:
         Split -> Match -> Group
@@ -122,36 +193,71 @@ class HallucinationDetector:
             })
 
         # Step 3: Grouping (Preparation for the LLM Judge)
-        # We group by 'source_chunk_index' so we can send 1 chunk + 5 claims to the Judge later
         grouped_checks = {}
+        skipped_claims = []
+        
         for p in processed_claims:
+            # THE FILTER: Only send "relevant" claims to the expensive LLM
+            if p["score"] < threshold:
+                skipped_claims.append(p)
+                continue
+
             idx = p["source_chunk_index"]
+            if idx == -1: continue
+
             if idx not in grouped_checks:
-                grouped_checks[idx] = {"chunk_text": chunks[idx] if idx != -1 else "None", "claims": []}
+                grouped_checks[idx] = {"chunk_text": chunks[idx], "claims": []}
             grouped_checks[idx]["claims"].append(p)
 
+        # Step 4: The Judge
+        verified_results = self.verify_claims(grouped_checks)
+        
         return {
-            "all_claims_scored": processed_claims, # For the Heatmap
-            "grouped_for_judge": grouped_checks    # For the verification step
+            "verified_results": verified_results,
+            "skipped_low_relevance": skipped_claims
         }
+        # We group by 'source_chunk_index' so we can send 1 chunk + 5 claims to the Judge later
+        # grouped_checks = {}
+        # for p in processed_claims:
+        #     idx = p["source_chunk_index"]
+        #     if idx not in grouped_checks:
+        #         grouped_checks[idx] = {"chunk_text": chunks[idx] if idx != -1 else "None", "claims": []}
+        #     grouped_checks[idx]["claims"].append(p)
+
+        # return {
+        #     "all_claims_scored": processed_claims, # For the Heatmap
+        #     "grouped_for_judge": grouped_checks    # For the verification step
+        # }
 
 # --- Quick Test Block ---
 if __name__ == "__main__":
     # Load your sample data
-    with open("data/output/sample2.json", "r") as f:
+    with open("data/output/finalBoss.json", "r") as f:
         data = json.load(f)
     
     # Initialize Detector (Replace with your actual key)
     api_key = os.getenv("OPENAI_API_KEY") 
     detector = HallucinationDetector(api_key)
 
-    # Run on the first example
-    result = detector.run_pipeline(data[0])
-    # print(result)
+    result = detector.run_pipeline(data[0], threshold=0.4) 
+
+    print("\n\n=== 🏁 FINAL REPORT 🏁 ===")
     
-    # Print results
-    print("\n--- RESULTS ---")
-    for claim in result["all_claims_scored"]:
-        status = "✅" if claim['score'] > 0.50 else "⚠️"
-        print(f"{status} [{claim['score']:.2f}] {claim['claim']}")
-        print(f"   Evidence: {claim['evidence_sentence'][:50]}...")
+    # 1. Show the Verified Claims
+    for res in result["verified_results"]:
+        icon = "✅"
+        if res["status"] == "Contradicted": icon = "❌"
+        elif res["status"] == "Ambiguous": icon = "⚠️"
+        elif res["status"] == "Not Mentioned": icon = "❓"
+        
+        print(f"\n{icon} [{res['status']}] {res['claim']}")
+        print(f"   Score: {res['score']:.2f}")
+        print(f"   Reasoning: {res['reasoning']}")
+        if res["status"] == "Contradicted":
+            print(f"   Correction: {res['correction']}")
+
+    # 2. Show what we skipped (Efficiency check)
+    if result["skipped_low_relevance"]:
+        print(f"\n--- Skipped {len(result['skipped_low_relevance'])} claims due to low relevance (< 0.45) ---")
+        for s in result["skipped_low_relevance"]:
+            print(f"   ⚠️ [{s['score']:.2f}] {s['claim']}")
