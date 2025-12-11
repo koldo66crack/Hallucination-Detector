@@ -2,6 +2,8 @@
 .venv/
 venv/
 ENV/
+.env/
+.env
 
 # Python cache files
 __pycache__/
