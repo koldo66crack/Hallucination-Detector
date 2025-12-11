@@ -1,11 +1,15 @@
-# Byte-compiled / optimized / DLL files
+# Python virtual environment
+.venv/
+venv/
+ENV/
+
+# Python cache files
 __pycache__/
 *.py[cod]
-*$py.class
 
-# Virtual environments
-venv/
-.env
-
-# macOS system files
+# Mac system files
 .DS_Store
+
+# Data output folders (Optional: keep these out of git if they get huge)
+data/output/
+data/results/
