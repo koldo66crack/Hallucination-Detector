@@ -40,6 +40,7 @@ class Verdict(BaseModel):
     is_supported: Literal["Supported", "Contradicted", "Not Mentioned", "Ambiguous"]
     explanation: str = Field(..., description="A brief explanation of why the claim is supported or not based *only* on the context.")
     correction: str = Field(..., description="If contradicted, provide the correct information from the context. If unsupported, state 'N/A'.")
+    confidence_score: float = Field(..., description="A score between 0.0 and 1.0 indicating how strong the evidence is. 1.0 = Explicit Statement, 0.5 = Strong Inference, 0.0 = Guess.")
 
 class BatchVerification(BaseModel):
     verdicts: List[Verdict]
@@ -216,20 +217,8 @@ class HallucinationDetector:
             "verified_results": verified_results,
             "skipped_low_relevance": skipped_claims
         }
-        # We group by 'source_chunk_index' so we can send 1 chunk + 5 claims to the Judge later
-        # grouped_checks = {}
-        # for p in processed_claims:
-        #     idx = p["source_chunk_index"]
-        #     if idx not in grouped_checks:
-        #         grouped_checks[idx] = {"chunk_text": chunks[idx] if idx != -1 else "None", "claims": []}
-        #     grouped_checks[idx]["claims"].append(p)
 
-        # return {
-        #     "all_claims_scored": processed_claims, # For the Heatmap
-        #     "grouped_for_judge": grouped_checks    # For the verification step
-        # }
-
-# --- Quick Test Block ---
+# --- Test Block ---
 if __name__ == "__main__":
     # Load your sample data
     with open("data/output/finalBoss.json", "r") as f:
